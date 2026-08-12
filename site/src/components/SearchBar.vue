@@ -7,7 +7,139 @@ import PhotoGallery from './PhotoGallery.vue'
 import { BookmarkIcon as BookmarkIconOutline } from '@heroicons/vue/24/outline'
 import { BookmarkIcon as BookmarkIconSolid } from '@heroicons/vue/24/solid'
 
-import Fuse from 'fuse.js'
+const FIELD_CANDIDATES = {
+  region: ['bodyRegion', 'bodyRegions', 'regions', 'BodyRegion', 'BodyRegions'],
+  goal: ['goal', 'goals', 'therapeuticGoal', 'therapeuticGoals', 'TherapeuticGoal'],
+  specialty: ['specialty', 'specialties', 'Specialty'],
+  equipment: ['equipment', 'equipments', 'Equipment'],
+  startPosition: ['startPosition', 'startPositions', 'StartPosition']
+}
+
+function normalizeCode(value) {
+  if (value === null || value === undefined) {
+    return ''
+  }
+
+  return String(value).trim().toLowerCase()
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) {
+    return value
+  }
+
+  if (value === null || value === undefined || value === '') {
+    return []
+  }
+
+  return [value]
+}
+
+function extractCode(value) {
+  if (value === null || value === undefined) {
+    return ''
+  }
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    return normalizeCode(value)
+  }
+
+  if (typeof value === 'object') {
+    return normalizeCode(value.code ?? value.id ?? value.value ?? value.name)
+  }
+
+  return ''
+}
+
+function getCodesByCandidates(exercise, candidates) {
+  const codes = []
+
+  candidates.forEach((field) => {
+    toArray(exercise[field]).forEach((entry) => {
+      const code = extractCode(entry)
+      if (code) {
+        codes.push(code)
+      }
+    })
+  })
+
+  return [...new Set(codes)]
+}
+
+function getDifficultyValue(exercise) {
+  if (typeof exercise.difficulty === 'number') {
+    return exercise.difficulty
+  }
+
+  if (typeof exercise.difficulty === 'string') {
+    const asNumber = Number(exercise.difficulty)
+    if (!Number.isNaN(asNumber)) {
+      return asNumber
+    }
+  }
+
+  const levelToDifficulty = {
+    beginner: 1,
+    intermediate: 3,
+    expert: 5
+  }
+
+  const mapped = levelToDifficulty[normalizeCode(exercise.level)]
+  return mapped ?? null
+}
+
+function resolveLocaleMatch(translations, locale) {
+  if (!Array.isArray(translations) || translations.length === 0) {
+    return null
+  }
+
+  if (!locale) {
+    return translations[0]
+  }
+
+  const normalizedLocale = locale.toLowerCase()
+
+  return (
+    translations.find((item) => normalizeCode(item.locale) === normalizedLocale) ||
+    translations.find((item) => {
+      const itemLocale = normalizeCode(item.locale)
+      return itemLocale && normalizedLocale.startsWith(itemLocale)
+    }) ||
+    translations[0]
+  )
+}
+
+function getLocalizedNameAndAka(exercise, locale) {
+  const translations =
+    exercise.exerciseTranslations || exercise.translations || exercise.ExerciseTranslation || []
+  const selectedTranslation = resolveLocaleMatch(toArray(translations), locale)
+
+  const localizedName =
+    selectedTranslation?.name || selectedTranslation?.title || exercise.name || exercise.id || ''
+
+  const localizedAka = [
+    ...toArray(selectedTranslation?.aka),
+    ...toArray(selectedTranslation?.aliases),
+    ...toArray(exercise.aka)
+  ]
+    .map((value) => String(value).trim())
+    .filter(Boolean)
+
+  return {
+    localizedName,
+    localizedAka
+  }
+}
+
+function getUniqueOptionValues(exercisesList, fieldKey) {
+  const values = new Set()
+
+  exercisesList.forEach((exercise) => {
+    getCodesByCandidates(exercise, FIELD_CANDIDATES[fieldKey]).forEach((code) => values.add(code))
+  })
+
+  return [...values].sort((a, b) => a.localeCompare(b))
+}
 
 export default {
   components: {
@@ -19,12 +151,22 @@ export default {
   data() {
     return {
       query: '',
-      exercises: exercises,
+      locale: typeof navigator !== 'undefined' ? navigator.language : 'en',
+      exercises,
       searchResults: exercises,
       pageSize: 50,
       currentPage: 0,
       savedExercises: [],
-      showSavedExercises: false
+      showSavedExercises: false,
+      filters: {
+        region: [],
+        goal: '',
+        specialty: '',
+        equipment: '',
+        difficultyMin: 1,
+        difficultyMax: 5,
+        startPosition: ''
+      }
     }
   },
   computed: {
@@ -47,6 +189,21 @@ export default {
       const startIndex = this.currentPage * this.pageSize
       const endIndex = startIndex + this.pageSize
       return this.searchResults.slice(0, endIndex)
+    },
+    regionOptions() {
+      return getUniqueOptionValues(this.exercises, 'region')
+    },
+    goalOptions() {
+      return getUniqueOptionValues(this.exercises, 'goal')
+    },
+    specialtyOptions() {
+      return getUniqueOptionValues(this.exercises, 'specialty')
+    },
+    equipmentOptions() {
+      return getUniqueOptionValues(this.exercises, 'equipment')
+    },
+    startPositionOptions() {
+      return getUniqueOptionValues(this.exercises, 'startPosition')
     }
   },
   methods: {
@@ -63,25 +220,88 @@ export default {
         // if we ended up with no exercises then let's clear the search and reset the results
         if (this.savedExercises.length == 0) {
           this.query = ''
-          this.searchResults = this.exercises
           this.showSavedExercises = false
-        } else {
-          this.searchResults = this.savedExercises
         }
       }
+
+      this.applyFilters()
     },
     toggleSavedExercises() {
       // toggle between showing all exercises and saved exercises
-      if (this.searchResults === this.savedExercises) {
-        this.searchResults = this.exercises
+      if (this.showSavedExercises) {
         this.showSavedExercises = false
       } else if (this.savedExercises.length > 0) {
-        this.searchResults = this.savedExercises
         this.showSavedExercises = true
       }
+
+      this.currentPage = 0
+      this.applyFilters()
     },
     isBookedMarked(exercise) {
       return this.savedExercises.includes(exercise)
+    },
+    onRegionChange(event) {
+      this.filters.region = [...event.target.selectedOptions].map((option) => option.value)
+    },
+    matchesSelection(exerciseValues, selectedValue) {
+      if (!selectedValue) {
+        return true
+      }
+
+      return exerciseValues.includes(normalizeCode(selectedValue))
+    },
+    matchesMultiSelection(exerciseValues, selectedValues) {
+      if (!Array.isArray(selectedValues) || selectedValues.length === 0) {
+        return true
+      }
+
+      const normalizedSelected = selectedValues.map((value) => normalizeCode(value))
+      return normalizedSelected.some((value) => exerciseValues.includes(value))
+    },
+    matchesDifficulty(exercise) {
+      const difficulty = getDifficultyValue(exercise)
+
+      if (difficulty === null) {
+        return true
+      }
+
+      return (
+        difficulty >= Number(this.filters.difficultyMin) &&
+        difficulty <= Number(this.filters.difficultyMax)
+      )
+    },
+    matchesFullText(exercise) {
+      if (!this.query.trim()) {
+        return true
+      }
+
+      const { localizedName, localizedAka } = getLocalizedNameAndAka(exercise, this.locale)
+      const haystack = [localizedName, ...localizedAka]
+        .map((value) => String(value).toLowerCase())
+        .join(' ')
+
+      return haystack.includes(this.query.trim().toLowerCase())
+    },
+    matchesFilters(exercise) {
+      const regionCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.region)
+      const goalCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.goal)
+      const specialtyCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.specialty)
+      const equipmentCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.equipment)
+      const startPositionCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.startPosition)
+
+      return (
+        this.matchesMultiSelection(regionCodes, this.filters.region) &&
+        this.matchesSelection(goalCodes, this.filters.goal) &&
+        this.matchesSelection(specialtyCodes, this.filters.specialty) &&
+        this.matchesSelection(equipmentCodes, this.filters.equipment) &&
+        this.matchesSelection(startPositionCodes, this.filters.startPosition) &&
+        this.matchesDifficulty(exercise) &&
+        this.matchesFullText(exercise)
+      )
+    },
+    applyFilters() {
+      const source = this.showSavedExercises ? this.savedExercises : this.exercises
+      this.searchResults = source.filter((exercise) => this.matchesFilters(exercise))
     }
   },
   mounted() {
@@ -101,34 +321,37 @@ export default {
     if (localStorage.getItem('savedExercises')) {
       this.savedExercises = JSON.parse(localStorage.getItem('savedExercises'))
     }
+
+    this.applyFilters()
   },
   watch: {
     savedExercises: {
       handler: function (val) {
         localStorage.setItem('savedExercises', JSON.stringify(val))
+
+        if (this.showSavedExercises) {
+          this.currentPage = 0
+          this.applyFilters()
+        }
       },
       deep: true
     },
-    query(newValue, _) {
-      const options = {
-        keys: ['id', 'name']
-      }
-
+    query() {
       this.currentPage = 0
-      this.showSavedExercises = false
-
-      if (this.query.length > 1) {
-        const fuse = new Fuse(this.exercises, options)
-        this.searchResults = fuse.search({ name: newValue }).map((r) => r.item)
-      } else {
-        this.searchResults = this.exercises
-      }
+      this.applyFilters()
+    },
+    filters: {
+      handler() {
+        this.currentPage = 0
+        this.applyFilters()
+      },
+      deep: true
     }
   }
 }
 </script>
 <template>
-  <div class="flex">
+  <div class="flex gap-4 items-start">
     <div class="w-full">
       <form @submit.prevent="onSubmit">
         <label
@@ -161,8 +384,7 @@ export default {
             autofocus="autofocus"
             id="search"
             class="block w-full p-4 pl-10 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500"
-            placeholder="Search Exercises, Instructions"
-            required
+            placeholder="Search by translation name or AKA"
           />
         </div>
       </form>
@@ -188,6 +410,92 @@ export default {
       </button>
     </div>
   </div>
+
+  <div class="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Region</label>
+      <select
+        multiple
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+        @change="onRegionChange"
+      >
+        <option v-for="region in regionOptions" :key="region" :value="region">{{ region }}</option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Goal</label>
+      <select
+        v-model="filters.goal"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      >
+        <option value="">All</option>
+        <option v-for="goal in goalOptions" :key="goal" :value="goal">{{ goal }}</option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Specialty</label>
+      <select
+        v-model="filters.specialty"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      >
+        <option value="">All</option>
+        <option v-for="specialty in specialtyOptions" :key="specialty" :value="specialty">
+          {{ specialty }}
+        </option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Equipment</label>
+      <select
+        v-model="filters.equipment"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      >
+        <option value="">All</option>
+        <option v-for="equipment in equipmentOptions" :key="equipment" :value="equipment">
+          {{ equipment }}
+        </option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Start Position</label>
+      <select
+        v-model="filters.startPosition"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      >
+        <option value="">All</option>
+        <option v-for="startPosition in startPositionOptions" :key="startPosition" :value="startPosition">
+          {{ startPosition }}
+        </option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Difficulty Min</label>
+      <input
+        v-model.number="filters.difficultyMin"
+        type="number"
+        min="1"
+        max="5"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      />
+    </div>
+
+    <div>
+      <label class="block mb-1 text-sm text-gray-700 dark:text-gray-200">Difficulty Max</label>
+      <input
+        v-model.number="filters.difficultyMax"
+        type="number"
+        min="1"
+        max="5"
+        class="block w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white"
+      />
+    </div>
+  </div>
+
   <div id="infinite-list">
     <div
       v-for="exercise in paginatedItems"
