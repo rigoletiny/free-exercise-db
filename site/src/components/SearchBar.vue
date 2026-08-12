@@ -279,8 +279,13 @@ export default {
       const haystack = [localizedName, ...localizedAka]
         .map((value) => String(value).toLowerCase())
         .join(' ')
+      const searchTerms = this.query
+        .toLowerCase()
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
 
-      return haystack.includes(this.query.trim().toLowerCase())
+      return searchTerms.every((term) => haystack.includes(term))
     },
     matchesFilters(exercise) {
       const regionCodes = getCodesByCandidates(exercise, FIELD_CANDIDATES.region)
